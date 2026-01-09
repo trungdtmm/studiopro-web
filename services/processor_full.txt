@@ -1,0 +1,414 @@
+﻿import { removeBackground, Config } from "@imgly/background-removal";
+import { GoogleGenerativeAI, SchemaType } from "@google/generative-ai";
+import { TARGET_DIMENSION, PADDING, ProductStrategy } from "../types";
+
+/**
+ * Lazy initialization of Gemini API to ensure environment is ready.
+ */
+const getAiClient = () => {
+  // Use GEMINI_API_KEY as defined in vite.config.ts or .env
+  const apiKey = (typeof process !== 'undefined' && process.env.GEMINI_API_KEY) ||
+    // @ts-ignore
+    (import.meta.env && import.meta.env.VITE_GEMINI_API_KEY) ||
+    '';
+  return new GoogleGenerativeAI(apiKey);
+};
+
+/**
+ * Helper to convert File to Base64
+ */
+const fileToBase64 = (file: File): Promise<string> => {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const result = reader.result as string;
+      const base64 = result.split(',')[1];
+      resolve(base64);
+    };
+    reader.onerror = reject;
+    reader.readAsDataURL(file);
+  });
+};
+
+/**
+ * Uses Gemini to detect the exact bounding box of the product.
+ * Optimized prompt to ignore internal details (like drawings on a book cover).
+ */
+const detectProductBox = async (file: File, base64: string): Promise<{ box: number[], type: string, strategy: ProductStrategy } | null> => {
+  try {
+    const ai = getAiClient();
+    const model = ai.getGenerativeModel({
+      model: 'gemini-1.5-flash',
+      generationConfig: {
+        responseMimeType: "application/json",
+        responseSchema: {
+          type: SchemaType.OBJECT,
+          properties: {
+            product_type: { type: SchemaType.STRING, description: "Detailed name of the product" },
+            category: {
+              type: SchemaType.STRING,
+              enum: ["book", "notebook", "stationery", "3d_toy", "3d_general", "generic"],
+              description: "Precise category of the item"
+            },
+            box_2d: {
+              type: SchemaType.ARRAY,
+              items: { type: SchemaType.INTEGER },
+              description: "[ymin, xmin, ymax, xmax]"
+            }
+          },
+          required: ["product_type", "category", "box_2d"]
+        }
+      }
+    });
+
+    const response = await model.generateContent({
+      contents: [{
+        role: 'user',
+        parts: [
+          { inlineData: { mimeType: file.type, data: base64 } },
+          {
+            text: `Critical Product Analysis:
+                   1. Identify the product name.
+                   2. CATEGORIZE precisely:
+                      - 'book': Textbooks (SÃ¡ch giÃ¡o khoa), comics, magazines.
+                      - 'notebook': Student notebooks (Vá»Ÿ káº» ngang, vá»Ÿ Ã´ ly), journals.
+                      - 'stationery': Flat items like stickers, labels, flat rectangular kits.
+                      - '3d_toy': Toys, dolls, complex 3D shapes.
+                      - '3d_general': Bottles, gadgets, electronics.
+
+                   STRATEGY RULE:
+                   - If it's a BOOK or NOTEBOOK, identify the ENTIRE RECTANGULAR COVER.
+                   - For 'book', 'notebook', and 'stationery', we will KEEP the background content within the box (No Background Removal).
+                   
+                   Return JSON: {"product_type": "...", "category": "...", "box_2d": [ymin, xmin, ymax, xmax]}` }
+        ]
+      }]
+    });
+
+    const result = response.response;
+    const text = result.text();
+    console.log("AI Analysis Result:", text);
+
+    if (text) {
+      const data = JSON.parse(text);
+      const isFlat = ['book', 'notebook', 'stationery'].includes(data.category);
+      const strategy: ProductStrategy = isFlat ? 'PRESERVE_CONTENT' : 'REJECT_BACKGROUND';
+
+      console.log(`Decision: ${strategy} for ${data.product_type} (${data.category})`);
+
+      if (data.box_2d && data.box_2d.length === 4 && data.product_type) {
+        return {
+          box: data.box_2d,
+          type: data.product_type,
+          strategy
+        };
+      }
+    }
+  } catch (error) {
+    console.error("AI Analysis Failed:", error);
+  }
+  return null;
+};
+
+/**
+ * Crops the image based on Gemini's normalized coordinates [ymin, xmin, ymax, xmax]
+ */
+const cropImageToBox = (file: File, box: number[]): Promise<Blob> => {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => {
+      const canvas = document.createElement('canvas');
+      const [ymin, xmin, ymax, xmax] = box;
+
+      // Convert normalized (0-1000) to pixels
+      let y1 = (ymin / 1000) * img.height;
+      let x1 = (xmin / 1000) * img.width;
+      let y2 = (ymax / 1000) * img.height;
+      let x2 = (xmax / 1000) * img.width;
+
+      // Add a very small padding (10px) to ensure edges aren't cut too harsh, 
+      // but tight enough to exclude background clutter.
+      const pad = 10;
+      y1 = Math.max(0, y1 - pad);
+      x1 = Math.max(0, x1 - pad);
+      y2 = Math.min(img.height, y2 + pad);
+      x2 = Math.min(img.width, x2 + pad);
+
+      const w = x2 - x1;
+      const h = y2 - y1;
+
+      canvas.width = w;
+      canvas.height = h;
+
+      const ctx = canvas.getContext('2d');
+      if (!ctx) {
+        reject(new Error("No context"));
+        return;
+      }
+
+      ctx.drawImage(img, x1, y1, w, h, 0, 0, w, h);
+
+      canvas.toBlob((blob) => {
+        if (blob) resolve(blob);
+        else reject(new Error("Crop failed"));
+      }, file.type);
+    };
+    img.onerror = reject;
+    img.src = URL.createObjectURL(file);
+  });
+};
+
+/**
+ * Orchestrates the full processing pipeline:
+ * 1. (NEW) Use Gemini to detect the product bounding box.
+ * 2. Crop the image to that box.
+ * 3. Remove background on the cropped image (More accurate).
+ * 4. Compose the final product shot.
+ */
+export const processProductImage = async (
+  file: File,
+  onProgress?: (step: string) => void
+): Promise<{ processedUrl: string; maskUrl: string; productType?: string; strategy?: ProductStrategy }> => {
+
+  let processingBlob: Blob = file;
+  let detectedType: string | undefined;
+  let strategy: ProductStrategy = 'GENERIC';
+
+  // Step 0: Gemini Smart Detection
+  const hasApiKey = (typeof process !== 'undefined' && process.env.GEMINI_API_KEY) ||
+    // @ts-ignore
+    (import.meta.env && import.meta.env.VITE_GEMINI_API_KEY);
+
+  if (hasApiKey) {
+    if (onProgress) onProgress("AI analyzing object category...");
+    try {
+      const base64 = await fileToBase64(file);
+      const result = await detectProductBox(file, base64);
+
+      if (result) {
+        detectedType = result.type;
+        strategy = result.strategy;
+        if (onProgress) onProgress(`Smart Category: ${strategy}...`);
+        processingBlob = await cropImageToBox(file, result.box);
+      }
+    } catch (e) {
+      console.warn("AI analysis failed, using generic processing", e);
+    }
+  }
+
+  // Step 1: Remove Background (ONLY IF STRATEGY IS NOT PRESERVE_CONTENT)
+  let blob: Blob;
+
+  if (strategy === 'PRESERVE_CONTENT') {
+    if (onProgress) onProgress("Preserving surface design (Book/Flat mode)...");
+    // For books/posters, the crop IS the extraction. 
+    // We skip ML background removal to avoid deleting cover art.
+    blob = processingBlob;
+  } else {
+    if (onProgress) onProgress("Professional extraction (Remove.bg)...");
+    try {
+      blob = await callRemoveBg(processingBlob);
+
+      if (onProgress) onProgress("Refining edge precision...");
+
+      // Optional: still verify quality or just accept Remove.bg's high quality
+      const tempUrl = URL.createObjectURL(blob);
+      const isSuccess = await verifyExtractionQuality(tempUrl, detectedType);
+      URL.revokeObjectURL(tempUrl);
+
+      if (!isSuccess) {
+        console.warn("Remove.bg result seems sparse, but trusting API quality");
+      }
+    } catch (error: any) {
+      console.error("Remove.bg failed, falling back to local extraction:", error);
+      if (onProgress) onProgress("Fallback: Local extraction...");
+
+      try {
+        const config: Config = {
+          model: 'isnet',
+          progress: (_key: string, current: number, total: number) => {
+            if (onProgress) {
+              const percent = Math.round((current / total) * 100);
+              onProgress(`Local Fallback: ${percent}%`);
+            }
+          }
+        };
+        blob = await removeBackground(processingBlob, config);
+      } catch (localError) {
+        console.error("Local fallback also failed:", localError);
+        blob = processingBlob;
+      }
+    }
+  }
+
+  // Create a URL for the transparent image (mask)
+  const maskUrl = URL.createObjectURL(blob);
+
+  // Step 2: Canvas Composition with Smart Centering
+  if (onProgress) onProgress("Finalizing studio composition...");
+
+  const processedUrl = await composeCanvas(maskUrl);
+
+  return { processedUrl, maskUrl, productType: detectedType, strategy };
+};
+
+/**
+ * Checks if the extraction result is "reasonable".
+ * If it's a book but only a tiny fragment was extracted, return false.
+ */
+const verifyExtractionQuality = (imageUrl: string, type?: string): Promise<boolean> => {
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.onload = () => {
+      const canvas = document.createElement("canvas");
+      canvas.width = img.width;
+      canvas.height = img.height;
+      const ctx = canvas.getContext("2d");
+      if (!ctx) return resolve(true);
+      ctx.drawImage(img, 0, 0);
+
+      const bounds = getSubjectBounds(ctx, img.width, img.height);
+      if (!bounds) return resolve(false);
+
+      // If it's a book, it should cover a significant portion of the image 
+      // (usually at least 15-20% of the area if it was cropped tightly by Gemini)
+      const areaRatio = (bounds.width * bounds.height) / (img.width * img.height);
+
+      if (type?.toLowerCase().includes('book') && areaRatio < 0.2) {
+        return resolve(false); // Likely extracted only a pattern on the cover
+      }
+
+      resolve(true);
+    };
+    img.onerror = () => resolve(true); // Default to true if cannot check
+    img.src = imageUrl;
+  });
+};
+
+/**
+ * Calls the professional Remove.bg API for high-quality background removal.
+ */
+const callRemoveBg = async (blob: Blob): Promise<Blob> => {
+  const apiKey = (typeof process !== 'undefined' && process.env.REMOVE_BG_API_KEY) ||
+    // @ts-ignore
+    (import.meta.env && import.meta.env.VITE_REMOVE_BG_API_KEY) ||
+    '';
+
+  if (!apiKey) {
+    throw new Error("Remove.bg API Key missing. Please check your configuration.");
+  }
+
+  const formData = new FormData();
+  formData.append("image_file", blob);
+  formData.append("size", "auto");
+
+  const response = await fetch("https://api.remove.bg/v1.0/removebg", {
+    method: "POST",
+    headers: {
+      "X-Api-Key": apiKey,
+    },
+    body: formData,
+  });
+
+  if (!response.ok) {
+    const errorData = await response.json().catch(() => ({}));
+    const errorMsg = errorData.errors?.[0]?.title || "Remove.bg API Error";
+    throw new Error(errorMsg);
+  }
+
+  return await response.blob();
+};
+
+/**
+ * Scans the pixel data to find the bounding box of the non-transparent subject.
+ * Ignores faint pixels (alpha < 20) to filter noise.
+ */
+const getSubjectBounds = (ctx: CanvasRenderingContext2D, width: number, height: number) => {
+  const imgData = ctx.getImageData(0, 0, width, height);
+  const data = imgData.data;
+  let minX = width, minY = height, maxX = 0, maxY = 0;
+  let found = false;
+
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const alpha = data[(y * width + x) * 4 + 3];
+      if (alpha > 20) {
+        if (x < minX) minX = x;
+        if (x > maxX) maxX = x;
+        if (y < minY) minY = y;
+        if (y > maxY) maxY = y;
+        found = true;
+      }
+    }
+  }
+  return found ? { x: minX, y: minY, width: maxX - minX + 1, height: maxY - minY + 1 } : null;
+};
+
+/**
+ * Handles the 800x800 white background + Smart Centering + Shadow logic
+ */
+const composeCanvas = (imageUrl: string): Promise<string> => {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.crossOrigin = "anonymous";
+    img.onload = () => {
+      // 1. Analyze Subject Bounds (on the already background-removed image)
+      const tempCanvas = document.createElement("canvas");
+      tempCanvas.width = img.width;
+      tempCanvas.height = img.height;
+      const tempCtx = tempCanvas.getContext("2d");
+      if (!tempCtx) return reject(new Error("No context"));
+      tempCtx.drawImage(img, 0, 0);
+      const bounds = getSubjectBounds(tempCtx, img.width, img.height);
+
+      // 2. Setup Target Canvas
+      const canvas = document.createElement("canvas");
+      canvas.width = TARGET_DIMENSION;
+      canvas.height = TARGET_DIMENSION;
+      const ctx = canvas.getContext("2d");
+      if (!ctx) return reject(new Error("No context"));
+
+      // Fill Background White
+      ctx.fillStyle = "#FFFFFF";
+      ctx.fillRect(0, 0, TARGET_DIMENSION, TARGET_DIMENSION);
+
+      if (bounds) {
+        // Calculate scale to fit the SUBJECT into the safe area
+        const safeArea = TARGET_DIMENSION - (PADDING * 2);
+        const scale = Math.min(safeArea / bounds.width, safeArea / bounds.height);
+
+        const drawWidth = bounds.width * scale;
+        const drawHeight = bounds.height * scale;
+
+        const drawX = (TARGET_DIMENSION - drawWidth) / 2;
+        const drawY = (TARGET_DIMENSION - drawHeight) / 2;
+
+        // Draw Shadow
+        ctx.save();
+        ctx.shadowColor = "rgba(0, 0, 0, 0.15)";
+        ctx.shadowBlur = 30;
+        ctx.shadowOffsetX = 0;
+        ctx.shadowOffsetY = 20;
+
+        // Draw ONLY the content within the bounding box
+        ctx.drawImage(
+          tempCanvas,
+          bounds.x, bounds.y, bounds.width, bounds.height, // Source crop
+          drawX, drawY, drawWidth, drawHeight // Destination placement
+        );
+        ctx.restore();
+      } else {
+        // Fallback for empty/transparent images
+        const scale = Math.min((TARGET_DIMENSION - PADDING * 2) / img.width, (TARGET_DIMENSION - PADDING * 2) / img.height);
+        const w = img.width * scale;
+        const h = img.height * scale;
+        ctx.drawImage(img, (TARGET_DIMENSION - w) / 2, (TARGET_DIMENSION - h) / 2, w, h);
+      }
+
+      const dataUrl = canvas.toDataURL("image/jpeg", 0.95);
+      resolve(dataUrl);
+    };
+    img.onerror = (err) => reject(err);
+    img.src = imageUrl;
+  });
+};
