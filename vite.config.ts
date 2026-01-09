@@ -4,7 +4,7 @@ import react from '@vitejs/plugin-react';
 
 export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, '.', '');
-  return {
+  return {`n    base: "/studiopro-web/",
     server: {
       port: 3000,
       host: '0.0.0.0',
@@ -25,3 +25,4 @@ export default defineConfig(({ mode }) => {
     }
   };
 });
+
